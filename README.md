@@ -41,6 +41,7 @@ npm run check-chrome
 npm run feishu-test
 npm run inspect
 npm run dry-run -- <城市+岗位类型>
+npm run run-task -- <城市+岗位类型>
 npm run auto-greet -- <城市+岗位类型>
 npm run auto-greet-enabled
 npm run stop
@@ -52,8 +53,9 @@ npm run stop
 2. 手动进入 BOSS 的目标岗位 `推荐牛人` 页面，并手动设置好筛选。
 3. 执行 `npm run check-chrome`。
 4. 执行 `npm run feishu-test`。
-5. 执行 `npm run dry-run -- 惠州销售`。
-6. 确认飞书规则和 dry-run 结果符合预期后，再执行 `npm run auto-greet -- 惠州销售`。
+5. 执行 `npm run run-task -- 惠州销售`。
+
+`run-task` 会先自动 dry-run 校验；校验通过后直接进入 auto-greet，不需要人工二次确认。
 
 ## 重要限制
 

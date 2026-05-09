@@ -99,6 +99,7 @@ async function cmdDryRun(jobKey) {
   };
   saveState(summary);
   console.log(JSON.stringify(summary, null, 2));
+  return summary;
 }
 
 async function cmdAutoGreet(jobKey, limitOverride = 0) {
@@ -223,6 +224,24 @@ async function cmdAutoGreet(jobKey, limitOverride = 0) {
   return output;
 }
 
+async function cmdRunTask(jobKey, limitOverride = 0) {
+  const dryRunSummary = await cmdDryRun(jobKey);
+  if (dryRunSummary.passCount <= 0) {
+    console.log(JSON.stringify({
+      mode: "run-task",
+      jobKey,
+      status: "dry-run-passed-no-targets",
+      message: "dry-run 校验通过，但当前可见候选人暂未命中；继续进入 auto-greet，由滚动和推荐池刷新逻辑寻找后续候选人。",
+      dryRun: {
+        runId: dryRunSummary.runId,
+        scanned: dryRunSummary.scanned,
+        passCount: dryRunSummary.passCount,
+      },
+    }, null, 2));
+  }
+  return cmdAutoGreet(jobKey, limitOverride);
+}
+
 async function cmdAutoGreetEnabled() {
   const tasks = await listEnabledTasks();
   const results = [];
@@ -250,6 +269,10 @@ try {
       if (!jobKey) throw new Error("缺少任务目标，例如：惠州销售");
       await cmdAutoGreet(jobKey, Number(limitArg || 0));
       break;
+    case "run-task":
+      if (!jobKey) throw new Error("缺少任务目标，例如：惠州销售");
+      await cmdRunTask(jobKey, Number(limitArg || 0));
+      break;
     case "auto-greet-enabled":
       await cmdAutoGreetEnabled();
       break;
@@ -258,6 +281,7 @@ try {
   node scripts/greeter_260505.mjs inspect
   node scripts/greeter_260505.mjs feishu-test
   node scripts/greeter_260505.mjs dry-run <城市+岗位类型>
+  node scripts/greeter_260505.mjs run-task <城市+岗位类型> [本次上限]
   node scripts/greeter_260505.mjs auto-greet <城市+岗位类型> [本次上限]
   node scripts/greeter_260505.mjs auto-greet-enabled`);
   }

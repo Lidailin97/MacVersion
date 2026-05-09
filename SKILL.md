@@ -42,11 +42,14 @@ bash scripts/check_chrome.sh
 node scripts/greeter_260505.mjs feishu-test
 node scripts/greeter_260505.mjs inspect
 node scripts/greeter_260505.mjs dry-run <城市+岗位类型>
+node scripts/greeter_260505.mjs run-task <城市+岗位类型> [本次上限]
 node scripts/greeter_260505.mjs auto-greet <城市+岗位类型>
 bash scripts/stop.sh
 ```
 
 `dry-run` 只筛选评分，不点击。
+
+`run-task` 是默认执行入口：先自动 dry-run 做无点击校验；只要 Chrome、BOSS 页面、飞书规则、岗位城市和风控检查都通过，就必须直接进入 `auto-greet`，不要向用户询问是否继续。dry-run 当前可见候选人命中数为 0 时，也继续进入 `auto-greet`，由滚动和推荐池刷新逻辑寻找后续候选人。
 
 `auto-greet` 会自动点击，但必须同时满足：
 
@@ -80,11 +83,24 @@ bash scripts/stop.sh
 1. preflight：Chrome/BOSS/飞书/停止信号检查
 2. load-task：只读取 `任务配置表`、`赋分标准`、`阈值配置`
 3. page-guard：确认当前推荐页与城市匹配
-4. use-current-filter：沿用用户已设置好的页面筛选
-5. scan：读取当前可见候选人
-6. score：硬筛、评分、排序
-7. greet：低频自动点击 Top N
-8. refresh-pool：连续 10 轮无合格候选人时点击 `推荐` 刷新推荐池，最多 3 次
-9. verify：点击后校验状态
-10. record：回写任务配置、任务记录、打招呼记录；不预读记录表
-11. summary：输出结果
+4. dry-run-check：无点击扫描当前可见候选人并保存校验快照；校验通过后不暂停、不二次确认
+5. use-current-filter：沿用用户已设置好的页面筛选
+6. scan：读取当前可见候选人
+7. score：硬筛、评分、排序
+8. greet：低频自动点击 Top N
+9. refresh-pool：连续 10 轮无合格候选人时点击 `推荐` 刷新推荐池，最多 3 次
+10. verify：点击后校验状态
+11. record：回写任务配置、任务记录、打招呼记录；不预读记录表
+12. summary：输出结果
+
+## 自动化默认策略
+
+用户要求“开始、继续、跑满、执行某城市任务”时，默认使用 `run-task`，不要把单独 `dry-run` 作为最终步骤，也不要在 dry-run 之后询问是否继续。
+
+只有以下情况需要停下并提醒用户：
+
+- 当前 BOSS 页岗位城市与任务城市不一致
+- BOSS 页签数量不唯一
+- 未登录、验证码、风控、频率限制、账号异常或页面不在推荐页
+- 飞书没有匹配且启用的任务，或 `招呼量` / 剩余量为 0
+- 脚本抛出点击校验失败、回写失败或明确风险信号
