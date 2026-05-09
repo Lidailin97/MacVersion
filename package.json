@@ -1,0 +1,21 @@
+{
+  "name": "macversion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mac version BOSS Zhipin Feishu-rule greeter using headed Chrome and AppleScript",
+  "type": "module",
+  "scripts": {
+    "check-chrome": "bash ./scripts/check_chrome.sh",
+    "feishu-test": "node ./scripts/greeter_260505.mjs feishu-test",
+    "inspect": "node ./scripts/greeter_260505.mjs inspect",
+    "dry-run": "node ./scripts/greeter_260505.mjs dry-run",
+    "auto-greet": "node ./scripts/greeter_260505.mjs auto-greet",
+    "auto-greet-auto-setup": "BOSS_AUTO_SETUP=1 node ./scripts/greeter_260505.mjs auto-greet",
+    "auto-greet-enabled": "node ./scripts/greeter_260505.mjs auto-greet-enabled",
+    "stop": "bash ./scripts/stop.sh"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

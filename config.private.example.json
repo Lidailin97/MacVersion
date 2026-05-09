@@ -1,0 +1,15 @@
+{
+  "operator": "your-name",
+  "feishu": {
+    "app_id": "cli_xxxxxxxxxxxxxxxx",
+    "app_secret": "your_feishu_app_secret",
+    "app_token": "your_feishu_app_token",
+    "tables": {
+      "task_config": "tbl_task_config",
+      "score_rules": "tbl_score_rules",
+      "thresholds": "tbl_thresholds",
+      "task_records": "tbl_task_records",
+      "greet_records": "tbl_greet_records"
+    }
+  }
+}

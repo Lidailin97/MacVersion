@@ -1,0 +1,51 @@
+function run() {
+  const paths = [
+    '/Users/dailinlee/Desktop/Google Chrome.app',
+    '/Applications/Google Chrome.app'
+  ];
+  let chrome = null;
+  let appPath = '';
+  for (const path of paths) {
+    try {
+      const app = Application(path);
+      if (app.running()) {
+        chrome = app;
+        appPath = path;
+        break;
+      }
+    } catch {}
+  }
+  if (!chrome) chrome = Application('/Applications/Google Chrome.app');
+  if (!chrome.running()) return JSON.stringify({ ok: false, code: 'CHROME_NOT_RUNNING' });
+
+  const tabs = [];
+  const windows = chrome.windows();
+  for (let wi = 0; wi < windows.length; wi += 1) {
+    const winTabs = windows[wi].tabs();
+    for (let ti = 0; ti < winTabs.length; ti += 1) {
+      const tab = winTabs[ti];
+      const url = String(tab.url() || '');
+      if (url.includes('zhipin.com')) {
+        tabs.push({ windowIndex: wi + 1, tabIndex: ti + 1, title: String(tab.title() || ''), url });
+      }
+    }
+  }
+  if (!tabs.length) return JSON.stringify({ ok: false, code: 'NO_BOSS_TAB' });
+  if (tabs.length > 1) return JSON.stringify({ ok: false, code: 'MULTIPLE_BOSS_TABS', appPath, tabs });
+
+  const target = windows[tabs[0].windowIndex - 1].tabs()[tabs[0].tabIndex - 1];
+  try {
+    const page = target.execute({
+      javascript: "JSON.stringify({ title: document.title, url: location.href, textLength: document.body ? document.body.innerText.length : 0 })",
+    });
+    return JSON.stringify({ ok: true, code: 'READY', appPath, tab: tabs[0], page: JSON.parse(page || '{}') });
+  } catch (error) {
+    return JSON.stringify({
+      ok: false,
+      code: 'APPLE_EVENTS_JS_FAILED',
+      tab: tabs[0],
+      hint: '在 Chrome 菜单 View > Developer 中启用 Allow JavaScript from Apple Events',
+      error: String(error.message || error),
+    });
+  }
+}
