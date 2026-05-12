@@ -22,7 +22,7 @@ function runtimeDir() {
   }
 }
 
-function runJxa(pageJavascript) {
+function runJxaAction(actionJavascript) {
   const dir = runtimeDir();
   const filePath = path.join(dir, `jxa-${Date.now()}-${Math.random().toString(16).slice(2)}.jxa`);
   const appPath = chromeAppPath();
@@ -44,13 +44,7 @@ function run() {
   if (tabs.length > 1) return JSON.stringify({ ok: false, code: 'MULTIPLE_BOSS_TABS', tabs });
   const targetMeta = tabs[0];
   const target = windows[targetMeta.windowIndex - 1].tabs()[targetMeta.tabIndex - 1];
-  let result = '';
-  try {
-    result = target.execute({ javascript: ${JSON.stringify(pageJavascript)} });
-  } catch (error) {
-    return JSON.stringify({ ok: false, code: 'APPLE_EVENTS_JS_FAILED', error: String(error.message || error), tab: targetMeta });
-  }
-  return JSON.stringify({ ok: true, tab: targetMeta, result: String(result || '') });
+  ${actionJavascript}
 }`;
   fs.writeFileSync(filePath, source);
   try {
@@ -64,10 +58,23 @@ function run() {
       error.details = wrapper;
       throw error;
     }
-    return JSON.parse(wrapper.result || "{}");
+    return wrapper;
   } finally {
     fs.rmSync(filePath, { force: true });
   }
+}
+
+function runJxa(pageJavascript) {
+  const wrapper = runJxaAction(`
+  let result = '';
+  try {
+    result = target.execute({ javascript: ${JSON.stringify(pageJavascript)} });
+  } catch (error) {
+    return JSON.stringify({ ok: false, code: 'APPLE_EVENTS_JS_FAILED', error: String(error.message || error), tab: targetMeta });
+  }
+  return JSON.stringify({ ok: true, tab: targetMeta, result: String(result || '') });
+  `);
+  return JSON.parse(wrapper.result || "{}");
 }
 
 const HELPERS = String.raw`
@@ -354,6 +361,249 @@ return JSON.stringify({
   success: target ? target.buttonText === '继续沟通' : true,
 });
 `);
+}
+
+function pageExpression(expression) {
+  return `(() => {\n${expression}\n})()`;
+}
+
+function clickExpression(candidate) {
+  return pageExpression(`
+const candidate = ${JSON.stringify(candidate)};
+const doc = window.__bossGreeter260505.getDoc();
+const text = window.__bossGreeter260505.textOfAll(doc);
+if (${HARD_STOP_PATTERN}.test(text)) {
+  return JSON.stringify({ ok: false, hardStop: true, reason: (text.match(${HARD_STOP_PATTERN}) || [''])[0] });
+}
+const cards = window.__bossGreeter260505.getCards(doc);
+const parsed = cards.map((card, index) => ({ element: card, raw: window.__bossGreeter260505.readCard(card, index) }));
+const target = parsed.find((item) => item.raw.fingerprint === candidate.fingerprint);
+if (!target) {
+  return JSON.stringify({ ok: false, reason: 'candidate_not_found' });
+}
+if (target.raw.buttonText !== '打招呼') {
+  return JSON.stringify({ ok: false, reason: 'button_not_greet', buttonText: target.raw.buttonText });
+}
+target.element.scrollIntoView({ block: 'center', behavior: 'instant' });
+const button = Array.from(target.element.querySelectorAll('.btn.btn-greet, .btn.btn-continue')).find((el) => window.__bossGreeter260505.normalize(el.textContent) === '打招呼');
+if (!button) {
+  return JSON.stringify({ ok: false, reason: 'button_missing_after_scroll' });
+}
+button.click();
+setTimeout(() => window.__bossGreeter260505.confirmGreet(doc), 500);
+return JSON.stringify({ ok: true, clicked: true, name: target.raw.name, fingerprint: target.raw.fingerprint });
+`);
+}
+
+function verifyExpression(candidate) {
+  return pageExpression(`
+const candidate = ${JSON.stringify(candidate)};
+const doc = window.__bossGreeter260505.getDoc();
+const text = window.__bossGreeter260505.textOfAll(doc);
+const cards = window.__bossGreeter260505.getCards(doc);
+const parsed = cards.map((card, index) => window.__bossGreeter260505.readCard(card, index));
+const target = parsed.find((item) => item.fingerprint === candidate.fingerprint || item.name === candidate.name);
+return JSON.stringify({
+  hardStop: ${HARD_STOP_PATTERN}.test(text),
+  hardStopText: (text.match(${HARD_STOP_PATTERN}) || [''])[0],
+  found: Boolean(target),
+  buttonText: target?.buttonText || '',
+  success: target ? target.buttonText === '继续沟通' : true,
+});
+`);
+}
+
+function scrollExpression() {
+  return pageExpression(`
+const doc = window.__bossGreeter260505.getDoc();
+const candidates = [doc.scrollingElement, doc.documentElement, doc.body, ...Array.from(doc.querySelectorAll('*'))].filter(Boolean);
+let best = doc.scrollingElement || doc.documentElement || doc.body;
+let bestRange = -1;
+for (const element of candidates) {
+  const range = Number(element.scrollHeight || 0) - Number(element.clientHeight || 0);
+  if (range <= 8) continue;
+  const style = element === doc.documentElement || element === doc.body || element === doc.scrollingElement ? { overflowY: 'auto' } : getComputedStyle(element);
+  if (!/(auto|scroll|overlay)/i.test(style.overflowY || '')) continue;
+  if (range > bestRange) { best = element; bestRange = range; }
+}
+const beforeTop = Number(best.scrollTop || 0);
+const step = Math.max(500, Math.floor((best.clientHeight || innerHeight) * 0.7));
+best.scrollTop = Math.min(beforeTop + step, Math.max(0, Number(best.scrollHeight || 0) - Number(best.clientHeight || 0)));
+return JSON.stringify({ beforeTop, afterTop: Number(best.scrollTop || 0), moved: Number(best.scrollTop || 0) !== beforeTop });
+`);
+}
+
+function fingerprintExpression(limit) {
+  return pageExpression(`
+const doc = window.__bossGreeter260505.getDoc();
+const text = window.__bossGreeter260505.textOfAll(doc);
+const cards = window.__bossGreeter260505.getCards(doc)
+  .map((card, index) => window.__bossGreeter260505.readCard(card, index))
+  .filter((card) => card.visible && card.fingerprint)
+  .sort((a, b) => a.top - b.top)
+  .slice(0, ${Number(limit) || 15});
+return JSON.stringify({
+  hardStop: ${HARD_STOP_PATTERN}.test(text),
+  hardStopText: (text.match(${HARD_STOP_PATTERN}) || [''])[0],
+  fingerprints: cards.map((card) => card.fingerprint),
+});
+`);
+}
+
+export function greetCandidates(candidates, options = {}) {
+  const targets = Array.isArray(candidates) ? candidates : [];
+  if (!targets.length) {
+    return {
+      results: [],
+      lastClickAt: Number(options.lastClickAt || 0),
+      nextClickIntervalMs: Number(options.nextClickIntervalMs || 3000),
+      waitBeforeClickMs: 0,
+      verifyWaitMs: 0,
+    };
+  }
+
+  const steps = targets.map((candidate) => ({
+    candidate,
+    clickScript: clickExpression(candidate),
+    verifyScript: verifyExpression(candidate),
+  }));
+  const wrapper = runJxaAction(`
+  const helperScript = ${JSON.stringify(HELPERS)};
+  const steps = ${JSON.stringify(steps)};
+  let lastClickAt = Number(${JSON.stringify(Number(options.lastClickAt || 0))});
+  let nextClickIntervalMs = Number(${JSON.stringify(Number(options.nextClickIntervalMs || 0))}) || Math.round(3000 + Math.random() * 2000);
+  const verifyMaxMs = Number(${JSON.stringify(Number(options.verifyMaxMs || 1500))});
+  const verifyPollMs = Number(${JSON.stringify(Number(options.verifyPollMs || 250))});
+  const output = { ok: true, tab: targetMeta, results: [], lastClickAt, nextClickIntervalMs, waitBeforeClickMs: 0, verifyWaitMs: 0 };
+
+  function sleepMs(ms) {
+    if (ms > 0) delay(ms / 1000);
+  }
+  function parseResult(raw) {
+    try {
+      return JSON.parse(String(raw || '{}'));
+    } catch (error) {
+      return { ok: false, reason: 'parse_failed', raw: String(raw || ''), error: String(error.message || error) };
+    }
+  }
+  function execPage(script) {
+    try {
+      return parseResult(target.execute({ javascript: script }));
+    } catch (error) {
+      return { ok: false, reason: 'APPLE_EVENTS_JS_FAILED', error: String(error.message || error) };
+    }
+  }
+
+  execPage(helperScript);
+  for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index];
+    if (lastClickAt) {
+      const waitMs = Math.max(0, nextClickIntervalMs - (Date.now() - lastClickAt));
+      output.waitBeforeClickMs += waitMs;
+      sleepMs(waitMs);
+    }
+    const click = execPage(step.clickScript);
+    if (!click.ok) {
+      const failed = Object.assign({}, step.candidate, { action: 'failed', result: click.reason || 'click_failed', click: click });
+      output.results.push(failed);
+      if (click.hardStop) {
+        output.hardStop = true;
+        output.hardStopText = click.reason || '';
+        break;
+      }
+      continue;
+    }
+
+    lastClickAt = Date.now();
+    nextClickIntervalMs = Math.round(3000 + Math.random() * 2000);
+    output.lastClickAt = lastClickAt;
+    output.nextClickIntervalMs = nextClickIntervalMs;
+
+    const verifyStartedAt = Date.now();
+    let verify = { success: false, buttonText: '' };
+    while (Date.now() - verifyStartedAt <= verifyMaxMs) {
+      sleepMs(verifyPollMs);
+      verify = execPage(step.verifyScript);
+      if (verify.hardStop || verify.success) break;
+    }
+    output.verifyWaitMs += Math.max(0, Date.now() - verifyStartedAt);
+    if (verify.hardStop) {
+      output.results.push(Object.assign({}, step.candidate, { action: 'failed', result: verify.hardStopText || 'hard_stop', click: click, verify: verify, hardStop: true }));
+      output.hardStop = true;
+      output.hardStopText = verify.hardStopText || '';
+      break;
+    }
+    if (!verify.success) {
+      output.results.push(Object.assign({}, step.candidate, { action: 'failed', result: 'verify_failed:' + (verify.buttonText || ''), click: click, verify: verify, stop: true }));
+      output.verifyFailed = true;
+      break;
+    }
+    output.results.push(Object.assign({}, step.candidate, { action: 'greeted', result: '成功', actionTime: lastClickAt, click: click, verify: verify }));
+  }
+  return JSON.stringify(output);
+  `);
+  return wrapper;
+}
+
+export function scrollForMoreAndWait(previousFingerprints = [], options = {}) {
+  const previous = Array.isArray(previousFingerprints) ? previousFingerprints : [];
+  const maxWaitMs = Number(options.maxWaitMs || 1600);
+  const pollMs = Number(options.pollMs || 300);
+  const limit = Number(options.limit || 15);
+  const wrapper = runJxaAction(`
+  const helperScript = ${JSON.stringify(HELPERS)};
+  const scrollScript = ${JSON.stringify(scrollExpression())};
+  const fingerprintScript = ${JSON.stringify(fingerprintExpression(limit))};
+  const previous = ${JSON.stringify(previous)};
+  const maxWaitMs = ${JSON.stringify(maxWaitMs)};
+  const pollMs = ${JSON.stringify(pollMs)};
+
+  function sleepMs(ms) {
+    if (ms > 0) delay(ms / 1000);
+  }
+  function parseResult(raw) {
+    try {
+      return JSON.parse(String(raw || '{}'));
+    } catch (error) {
+      return { ok: false, reason: 'parse_failed', raw: String(raw || ''), error: String(error.message || error) };
+    }
+  }
+  function execPage(script) {
+    try {
+      return parseResult(target.execute({ javascript: script }));
+    } catch (error) {
+      return { ok: false, reason: 'APPLE_EVENTS_JS_FAILED', error: String(error.message || error) };
+    }
+  }
+  function changed(next) {
+    if (!Array.isArray(next)) return false;
+    if (next.length !== previous.length) return true;
+    for (let index = 0; index < next.length; index += 1) {
+      if (next[index] !== previous[index]) return true;
+    }
+    return false;
+  }
+
+  execPage(helperScript);
+  const scroll = execPage(scrollScript);
+  const startedAt = Date.now();
+  let fingerprintResult = execPage(fingerprintScript);
+  while (!fingerprintResult.hardStop && !changed(fingerprintResult.fingerprints) && Date.now() - startedAt < maxWaitMs) {
+    sleepMs(pollMs);
+    fingerprintResult = execPage(fingerprintScript);
+  }
+  return JSON.stringify({
+    ok: true,
+    tab: targetMeta,
+    scroll,
+    changed: changed(fingerprintResult.fingerprints),
+    waitMs: Math.max(0, Date.now() - startedAt),
+    hardStop: Boolean(fingerprintResult.hardStop),
+    hardStopText: fingerprintResult.hardStopText || '',
+    fingerprints: fingerprintResult.fingerprints || [],
+  });
+  `);
+  return wrapper;
 }
 
 export function scrollForMore() {

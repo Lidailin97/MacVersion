@@ -1,4 +1,4 @@
-import { inspectPage, assertReadyPage, readCurrentJobName, switchJobByCity, applyVipFilters, scanCandidates, clickGreet, verifyGreet, scrollForMore, refreshRecommendPool } from "./boss_page_adapter.mjs";
+import { inspectPage, assertReadyPage, readCurrentJobName, switchJobByCity, applyVipFilters, scanCandidates, greetCandidates, scrollForMoreAndWait, refreshRecommendPool } from "./boss_page_adapter.mjs";
 import { listEnabledTasks, loadJobRule, testFeishuConnection, writeRunResult } from "./feishu_rules.mjs";
 import { rankCandidates } from "./scorer.mjs";
 import { clearStop, runId, saveState, shouldStop, writePid } from "./run_state.mjs";
@@ -15,17 +15,6 @@ function randomClickInterval(rule) {
   const min = 3;
   const max = 5;
   return Math.round((min + Math.random() * (max - min)) * 1000);
-}
-
-function randomVerifyDelay() {
-  return Math.round(800 + Math.random() * 400);
-}
-
-async function waitForClickSlot(lastClickAt, intervalMs) {
-  if (!lastClickAt) return 0;
-  const waitMs = Math.max(0, intervalMs - (Date.now() - lastClickAt));
-  if (waitMs > 0) await sleep(waitMs);
-  return waitMs;
 }
 
 function assertJobMatches(pageJobName, rule) {
@@ -147,49 +136,78 @@ async function cmdAutoGreet(jobKey, limitOverride = 0, options = {}) {
   const records = [];
   let lastClickAt = 0;
   let nextClickIntervalMs = randomClickInterval(rule);
-  let waitBeforeClickMs = 0;
+  const timings = {
+    scanMs: 0,
+    scoreMs: 0,
+    batchGreetMs: 0,
+    waitBeforeClickMs: 0,
+    verifyWaitMs: 0,
+    scrollWaitMs: 0,
+    refreshWaitMs: 0,
+    writeMs: 0,
+  };
 
   while (greeted < rule.limits.maxGreetsPerRun) {
     if (shouldStop()) break;
+    const scanStartedAt = Date.now();
     const scan = scanCandidates(rule.limits.scanBatchSize);
+    timings.scanMs += Date.now() - scanStartedAt;
     if (scan.hardStop) throw new Error(`检测到风控/异常信号: ${scan.hardStopText}`);
     seen += scan.cards.length;
 
+    const scoreStartedAt = Date.now();
     const ranked = rankCandidates(scan.cards, rule);
+    timings.scoreMs += Date.now() - scoreStartedAt;
     const targets = ranked
       .filter((item) => item.pass && !clickedFingerprints.has(item.fingerprint))
       .slice(0, Math.min(rule.limits.maxGreetsPerBatch, rule.limits.maxGreetsPerRun - greeted));
 
-    for (const target of targets) {
-      if (shouldStop()) break;
-      waitBeforeClickMs += await waitForClickSlot(lastClickAt, nextClickIntervalMs);
-      const click = clickGreet(target);
-      if (!click.ok) {
-        failed++;
-        records.push({ runId: id, jobKey, ...target, action: "failed", result: click.reason || "click_failed" });
-        if (click.hardStop) throw new Error(`检测到风控/异常信号: ${click.reason}`);
-        continue;
+    if (targets.length > 0) {
+      const batchStartedAt = Date.now();
+      const batch = greetCandidates(targets, {
+        lastClickAt,
+        nextClickIntervalMs,
+        verifyMaxMs: 1500,
+        verifyPollMs: 250,
+      });
+      timings.batchGreetMs += Date.now() - batchStartedAt;
+      timings.waitBeforeClickMs += Number(batch.waitBeforeClickMs || 0);
+      timings.verifyWaitMs += Number(batch.verifyWaitMs || 0);
+      lastClickAt = Number(batch.lastClickAt || lastClickAt);
+      nextClickIntervalMs = Number(batch.nextClickIntervalMs || nextClickIntervalMs || randomClickInterval(rule));
+      if (batch.hardStop && !(batch.results || []).length) {
+        throw new Error(`检测到风控/异常信号: ${batch.hardStopText || "hard_stop"}`);
       }
-      lastClickAt = Date.now();
-      nextClickIntervalMs = randomClickInterval(rule);
-      clickedFingerprints.add(target.fingerprint);
-      await sleep(randomVerifyDelay());
-      const verify = verifyGreet(target);
-      if (verify.hardStop) throw new Error(`检测到风控/异常信号: ${verify.hardStopText}`);
-      if (!verify.success) {
-        failed++;
-        records.push({ runId: id, jobKey, ...target, action: "failed", result: `verify_failed:${verify.buttonText}` });
-        throw new Error(`点击后状态未确认，已停止避免重复点击: ${target.name}`);
+
+      for (const result of batch.results || []) {
+        if (result.hardStop || batch.hardStop) {
+          throw new Error(`检测到风控/异常信号: ${result.result || batch.hardStopText || "hard_stop"}`);
+        }
+        if (result.action === "greeted") {
+          greeted++;
+          clickedFingerprints.add(result.fingerprint);
+          records.push({ runId: id, jobKey, pageJobName, ...result, action: "greeted", result: "成功", actionTime: result.actionTime || Date.now() });
+        } else {
+          failed++;
+          records.push({ runId: id, jobKey, pageJobName, ...result, action: "failed", result: result.result || "click_failed" });
+          if (result.stop || batch.verifyFailed) {
+            throw new Error(`点击后状态未确认，已停止避免重复点击: ${result.name || "unknown"}`);
+          }
+        }
+        saveState({ runId: id, mode: "auto-greet", jobKey, pageJobName, greeted, failed, seen, skipped, timings });
+        if (greeted >= rule.limits.maxGreetsPerRun) break;
       }
-      greeted++;
-      records.push({ runId: id, jobKey, pageJobName, ...target, action: "greeted", result: "成功", actionTime: lastClickAt });
-      saveState({ runId: id, mode: "auto-greet", jobKey, pageJobName, greeted, failed, seen, skipped, waitBeforeClickMs });
-      if (greeted >= rule.limits.maxGreetsPerRun) break;
     }
 
     skipped += ranked.filter((item) => !item.pass).length;
     if (targets.length === 0) {
-      scrollForMore();
+      const scroll = scrollForMoreAndWait(scan.cards.map((card) => card.fingerprint), {
+        maxWaitMs: 1600,
+        pollMs: 300,
+        limit: rule.limits.scanBatchSize,
+      });
+      timings.scrollWaitMs += Number(scroll.waitMs || 0);
+      if (scroll.hardStop) throw new Error(`检测到风控/异常信号: ${scroll.hardStopText}`);
       noProgressRounds += 1;
       if (noProgressRounds >= 10) {
         if (refreshes >= maxRefreshes) {
@@ -204,12 +222,13 @@ async function cmdAutoGreet(jobKey, limitOverride = 0, options = {}) {
         }
         refreshes++;
         noProgressRounds = 0;
-        saveState({ runId: id, mode: "auto-greet", jobKey, pageJobName, greeted, failed, seen, skipped, refreshes, waitBeforeClickMs });
+        saveState({ runId: id, mode: "auto-greet", jobKey, pageJobName, greeted, failed, seen, skipped, refreshes, timings });
+        const refreshWaitStartedAt = Date.now();
         await sleep(3000);
+        timings.refreshWaitMs += Date.now() - refreshWaitStartedAt;
         assertReadyPage();
         continue;
       }
-      await sleep(2000);
     } else {
       noProgressRounds = 0;
     }
@@ -217,6 +236,7 @@ async function cmdAutoGreet(jobKey, limitOverride = 0, options = {}) {
 
   const projectedCompletedToday = rule.progress.completedToday + greeted;
   const status = projectedCompletedToday >= rule.progress.target ? "已完成" : "提前结束";
+  timings.totalMs = Date.now() - startedAt;
   const summary = {
     runId: id,
     mode: "auto-greet",
@@ -234,10 +254,15 @@ async function cmdAutoGreet(jobKey, limitOverride = 0, options = {}) {
     stopReason: status === "已完成" ? "" : (shouldStop() ? "用户手动停止" : stopReason || `刷新推荐池${refreshes}次后仍连续${noProgressRounds}轮未找到可打候选人或页面无更多进展`),
     startedAt,
     endedAt: Date.now(),
+    timings,
   };
+  const writeStartedAt = Date.now();
   const writeResult = await writeRunResult(rule, summary, records);
+  timings.writeMs = Date.now() - writeStartedAt;
+  timings.totalMs = Date.now() - startedAt;
   const output = {
     ...summary,
+    timings,
     writeResult,
   };
   saveState(output);
