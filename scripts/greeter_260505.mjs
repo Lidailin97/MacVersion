@@ -11,10 +11,21 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function randomDelay(rule) {
+function randomClickInterval(rule) {
   const min = 3;
   const max = 5;
   return Math.round((min + Math.random() * (max - min)) * 1000);
+}
+
+function randomVerifyDelay() {
+  return Math.round(800 + Math.random() * 400);
+}
+
+async function waitForClickSlot(lastClickAt, intervalMs) {
+  if (!lastClickAt) return 0;
+  const waitMs = Math.max(0, intervalMs - (Date.now() - lastClickAt));
+  if (waitMs > 0) await sleep(waitMs);
+  return waitMs;
 }
 
 function assertJobMatches(pageJobName, rule) {
@@ -74,15 +85,16 @@ async function cmdFeishuTest() {
   console.log(JSON.stringify(await testFeishuConnection(), null, 2));
 }
 
-async function cmdDryRun(jobKey) {
+async function cmdDryRun(jobKey, options = {}) {
   writePid();
   clearStop();
-  const { rule, pageJobName } = await loadContext(jobKey);
+  const context = options.context || await loadContext(jobKey);
+  const { rule, pageJobName, switchResult } = context;
   const id = runId(rule.city, rule.jobType);
-  const filterResult = process.env.BOSS_AUTO_SETUP !== "1"
+  const filterResult = options.filterResult || (process.env.BOSS_AUTO_SETUP !== "1"
     ? { attempted: false, skipped: true, reason: "manual_setup" }
-    : applyVipFilters(rule);
-  await sleep(1500);
+    : applyVipFilters(rule));
+  if (!options.skipInitialSettle) await sleep(1500);
   const scan = scanCandidates(rule.limits.scanBatchSize);
   if (scan.hardStop) throw new Error(`检测到风控/异常信号: ${scan.hardStopText}`);
   const ranked = rankCandidates(scan.cards, rule);
@@ -99,14 +111,17 @@ async function cmdDryRun(jobKey) {
   };
   saveState(summary);
   console.log(JSON.stringify(summary, null, 2));
+  if (options.withContext) return { summary, context: { rule, pageJobName, switchResult }, filterResult };
   return summary;
 }
 
-async function cmdAutoGreet(jobKey, limitOverride = 0) {
+async function cmdAutoGreet(jobKey, limitOverride = 0, options = {}) {
   const startedAt = Date.now();
-  writePid();
-  clearStop();
-  const { rule, pageJobName, switchResult } = await loadContext(jobKey);
+  if (!options.reusePreflight) {
+    writePid();
+    clearStop();
+  }
+  const { rule, pageJobName, switchResult } = options.context || await loadContext(jobKey);
   const id = runId(rule.city, rule.jobType);
   if (!rule.allowAutoGreet) throw new Error(`飞书规则未允许自动点击: ${jobKey}`);
   if (limitOverride > 0) {
@@ -115,10 +130,10 @@ async function cmdAutoGreet(jobKey, limitOverride = 0) {
   }
   if (rule.limits.maxGreetsPerRun <= 0) throw new Error(`飞书规则单轮最大打招呼数为 0: ${jobKey}`);
 
-  const filterResult = process.env.BOSS_AUTO_SETUP !== "1"
+  const filterResult = options.filterResult || (process.env.BOSS_AUTO_SETUP !== "1"
     ? { attempted: false, skipped: true, reason: "manual_setup" }
-    : applyVipFilters(rule);
-  await sleep(1500);
+    : applyVipFilters(rule));
+  if (!options.skipInitialSettle) await sleep(1500);
 
   let greeted = 0;
   let seen = 0;
@@ -130,6 +145,9 @@ async function cmdAutoGreet(jobKey, limitOverride = 0) {
   let stopReason = "";
   const clickedFingerprints = new Set();
   const records = [];
+  let lastClickAt = 0;
+  let nextClickIntervalMs = randomClickInterval(rule);
+  let waitBeforeClickMs = 0;
 
   while (greeted < rule.limits.maxGreetsPerRun) {
     if (shouldStop()) break;
@@ -144,6 +162,7 @@ async function cmdAutoGreet(jobKey, limitOverride = 0) {
 
     for (const target of targets) {
       if (shouldStop()) break;
+      waitBeforeClickMs += await waitForClickSlot(lastClickAt, nextClickIntervalMs);
       const click = clickGreet(target);
       if (!click.ok) {
         failed++;
@@ -151,8 +170,10 @@ async function cmdAutoGreet(jobKey, limitOverride = 0) {
         if (click.hardStop) throw new Error(`检测到风控/异常信号: ${click.reason}`);
         continue;
       }
+      lastClickAt = Date.now();
+      nextClickIntervalMs = randomClickInterval(rule);
       clickedFingerprints.add(target.fingerprint);
-      await sleep(randomDelay(rule));
+      await sleep(randomVerifyDelay());
       const verify = verifyGreet(target);
       if (verify.hardStop) throw new Error(`检测到风控/异常信号: ${verify.hardStopText}`);
       if (!verify.success) {
@@ -161,8 +182,8 @@ async function cmdAutoGreet(jobKey, limitOverride = 0) {
         throw new Error(`点击后状态未确认，已停止避免重复点击: ${target.name}`);
       }
       greeted++;
-      records.push({ runId: id, jobKey, pageJobName, ...target, action: "greeted", result: "成功", actionTime: Date.now() });
-      saveState({ runId: id, mode: "auto-greet", jobKey, pageJobName, greeted, failed, seen, skipped });
+      records.push({ runId: id, jobKey, pageJobName, ...target, action: "greeted", result: "成功", actionTime: lastClickAt });
+      saveState({ runId: id, mode: "auto-greet", jobKey, pageJobName, greeted, failed, seen, skipped, waitBeforeClickMs });
       if (greeted >= rule.limits.maxGreetsPerRun) break;
     }
 
@@ -183,7 +204,7 @@ async function cmdAutoGreet(jobKey, limitOverride = 0) {
         }
         refreshes++;
         noProgressRounds = 0;
-        saveState({ runId: id, mode: "auto-greet", jobKey, pageJobName, greeted, failed, seen, skipped, refreshes });
+        saveState({ runId: id, mode: "auto-greet", jobKey, pageJobName, greeted, failed, seen, skipped, refreshes, waitBeforeClickMs });
         await sleep(3000);
         assertReadyPage();
         continue;
@@ -225,7 +246,8 @@ async function cmdAutoGreet(jobKey, limitOverride = 0) {
 }
 
 async function cmdRunTask(jobKey, limitOverride = 0) {
-  const dryRunSummary = await cmdDryRun(jobKey);
+  const dryRunResult = await cmdDryRun(jobKey, { withContext: true });
+  const dryRunSummary = dryRunResult.summary;
   if (dryRunSummary.passCount <= 0) {
     console.log(JSON.stringify({
       mode: "run-task",
@@ -239,7 +261,12 @@ async function cmdRunTask(jobKey, limitOverride = 0) {
       },
     }, null, 2));
   }
-  return cmdAutoGreet(jobKey, limitOverride);
+  return cmdAutoGreet(jobKey, limitOverride, {
+    context: dryRunResult.context,
+    filterResult: dryRunResult.filterResult,
+    reusePreflight: true,
+    skipInitialSettle: true,
+  });
 }
 
 async function cmdAutoGreetEnabled() {
