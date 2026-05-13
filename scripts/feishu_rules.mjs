@@ -423,8 +423,6 @@ export async function writeTaskRecord(rule, summary) {
     打招呼数: greeted,
     失败数: Number(summary.failed || 0),
     跳过数: Number(summary.skipped || 0),
-    打招呼率: seen ? Number(((greeted / seen) * 100).toFixed(1)) : 0,
-    招呼浏览比: greeted ? Number((seen / greeted).toFixed(2)) : 0,
     最终状态: summary.status,
     停止原因: summary.stopReason || "",
     备注: summary.note || "",
