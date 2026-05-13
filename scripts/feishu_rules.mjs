@@ -135,6 +135,39 @@ function numberField(fields, fallback, ...names) {
   return fallback;
 }
 
+function shanghaiDayKey(date) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const get = (type) => parts.find((part) => part.type === type)?.value || "";
+  return [get("year"), get("month"), get("day")].filter(Boolean).join("-");
+}
+
+function dayKeyFromValue(value) {
+  const text = unwrap(value).trim();
+  if (!text) return "";
+  const match = text.match(/(\d{4})[/-](\d{1,2})[/-](\d{1,2})/);
+  if (match) {
+    return `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
+  }
+  const numeric = Number(text);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    const date = new Date(numeric > 1e12 ? numeric : numeric * 1000);
+    if (!Number.isNaN(date.getTime())) return shanghaiDayKey(date);
+  }
+  const date = new Date(text);
+  if (!Number.isNaN(date.getTime())) return shanghaiDayKey(date);
+  return "";
+}
+
+function isTodayInShanghai(value) {
+  const key = dayKeyFromValue(value);
+  return Boolean(key) && key === shanghaiDayKey(new Date());
+}
+
 export function normalizeKey(value) {
   return String(value || "").replace(/\s+/g, "").toLowerCase();
 }
@@ -148,8 +181,13 @@ function parseTask(record) {
   const city = first(fields, "城市");
   const jobType = first(fields, "岗位类型") || "销售";
   const target = numberField(fields, 0, "招呼量", "招呼任务量", "单轮最大打招呼数");
-  const completedToday = numberField(fields, 0, "今日已完成");
-  const remainingToday = fields["今日剩余"] == null ? Math.max(0, target - completedToday) : numberField(fields, 0, "今日剩余");
+  const updatedAt = first(fields, "最后更新时间");
+  const sameDayProgress = isTodayInShanghai(updatedAt);
+  const rawCompletedToday = numberField(fields, 0, "今日已完成");
+  const completedToday = sameDayProgress ? rawCompletedToday : 0;
+  const remainingToday = sameDayProgress
+    ? (fields["今日剩余"] == null ? Math.max(0, target - completedToday) : numberField(fields, 0, "今日剩余"))
+    : target;
   const enabled = boolField(fields["是否启用"] ?? fields["启用"]);
   return {
     recordId: record.record_id,
@@ -194,8 +232,9 @@ function parseTask(record) {
       target,
       completedToday,
       remainingToday,
-      status: first(fields, "任务状态"),
-      updatedAt: first(fields, "最后更新时间"),
+      status: sameDayProgress ? first(fields, "任务状态") : "",
+      updatedAt,
+      sameDayProgress,
     },
     rawFields: fields,
   };
