@@ -51,6 +51,30 @@ function summarizePolicy(rule) {
   };
 }
 
+function riskWarningFrom(source) {
+  if (!source) return "";
+  if (typeof source === "string") return source.trim();
+  for (const key of ["riskWarning", "hardStopText", "warning", "reason", "result", "hardStopKeyword"]) {
+    const value = source[key];
+    if (value && String(value).trim() && String(value).trim() !== "hard_stop") return String(value).trim();
+  }
+  return riskWarningFrom(source.verify) || riskWarningFrom(source.click);
+}
+
+function makeRiskError(source, stage) {
+  const warning = riskWarningFrom(source) || "hard_stop";
+  const error = new Error(`检测到风控/异常信号${stage ? `（${stage}）` : ""}: ${warning}`);
+  error.riskWarning = warning;
+  error.riskStage = stage || "";
+  error.riskKeyword = source?.hardStopKeyword || "";
+  error.riskTexts = source?.hardStopTexts || [];
+  return error;
+}
+
+function throwRisk(source, stage) {
+  throw makeRiskError(source, stage);
+}
+
 async function loadContext(jobKey) {
   const page = assertReadyPage();
   const rule = await loadJobRule(jobKey);
@@ -85,7 +109,7 @@ async function cmdDryRun(jobKey, options = {}) {
     : applyVipFilters(rule));
   if (!options.skipInitialSettle) await sleep(1500);
   const scan = scanCandidates(rule.limits.scanBatchSize);
-  if (scan.hardStop) throw new Error(`检测到风控/异常信号: ${scan.hardStopText}`);
+  if (scan.hardStop) throwRisk(scan, "dry-run扫描");
   const ranked = rankCandidates(scan.cards, rule);
   const summary = {
     runId: id,
@@ -152,7 +176,7 @@ async function cmdAutoGreet(jobKey, limitOverride = 0, options = {}) {
     const scanStartedAt = Date.now();
     const scan = scanCandidates(rule.limits.scanBatchSize);
     timings.scanMs += Date.now() - scanStartedAt;
-    if (scan.hardStop) throw new Error(`检测到风控/异常信号: ${scan.hardStopText}`);
+    if (scan.hardStop) throwRisk(scan, "扫描候选人");
     seen += scan.cards.length;
 
     const scoreStartedAt = Date.now();
@@ -176,12 +200,12 @@ async function cmdAutoGreet(jobKey, limitOverride = 0, options = {}) {
       lastClickAt = Number(batch.lastClickAt || lastClickAt);
       nextClickIntervalMs = Number(batch.nextClickIntervalMs || nextClickIntervalMs || randomClickInterval(rule));
       if (batch.hardStop && !(batch.results || []).length) {
-        throw new Error(`检测到风控/异常信号: ${batch.hardStopText || "hard_stop"}`);
+        throwRisk(batch, "批量点击");
       }
 
       for (const result of batch.results || []) {
         if (result.hardStop || batch.hardStop) {
-          throw new Error(`检测到风控/异常信号: ${result.result || batch.hardStopText || "hard_stop"}`);
+          throwRisk(result.hardStop ? result : batch, "点击后校验");
         }
         if (result.action === "greeted") {
           greeted++;
@@ -207,7 +231,7 @@ async function cmdAutoGreet(jobKey, limitOverride = 0, options = {}) {
         limit: rule.limits.scanBatchSize,
       });
       timings.scrollWaitMs += Number(scroll.waitMs || 0);
-      if (scroll.hardStop) throw new Error(`检测到风控/异常信号: ${scroll.hardStopText}`);
+      if (scroll.hardStop) throwRisk(scroll, "滚动刷新候选人");
       noProgressRounds += 1;
       if (noProgressRounds >= 10) {
         if (refreshes >= maxRefreshes) {
@@ -215,7 +239,7 @@ async function cmdAutoGreet(jobKey, limitOverride = 0, options = {}) {
           break;
         }
         const refresh = refreshRecommendPool();
-        if (refresh.hardStop) throw new Error(`检测到风控/异常信号: ${refresh.reason}`);
+        if (refresh.hardStop) throwRisk(refresh, "刷新推荐池");
         if (!refresh.ok) {
           stopReason = `刷新推荐池失败:${refresh.reason || "unknown"}`;
           break;
@@ -338,7 +362,31 @@ try {
   node scripts/greeter_260505.mjs auto-greet-enabled`);
   }
 } catch (error) {
-  saveState({ error: error.message, stack: error.stack, command, jobKey, time: new Date().toISOString() });
-  console.error(error.message);
+  const failure = {
+    status: error.riskWarning ? "失败" : undefined,
+    stopReason: error.riskWarning ? "检测到风控/异常信号" : undefined,
+    riskStage: error.riskStage || "",
+    riskWarning: error.riskWarning || "",
+    riskKeyword: error.riskKeyword || "",
+    riskTexts: error.riskTexts || [],
+    error: error.message,
+    stack: error.stack,
+    command,
+    jobKey,
+    time: new Date().toISOString(),
+  };
+  saveState(failure);
+  if (error.riskWarning) {
+    console.error(JSON.stringify({
+      status: "失败",
+      stopReason: "检测到风控/异常信号，任务已停止",
+      riskStage: error.riskStage || "",
+      riskWarning: error.riskWarning,
+      riskKeyword: error.riskKeyword || "",
+      riskTexts: error.riskTexts || [],
+    }, null, 2));
+  } else {
+    console.error(error.message);
+  }
   process.exit(1);
 }

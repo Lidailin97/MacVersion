@@ -105,6 +105,90 @@ const HELPERS = String.raw`
     return '';
   };
   const textOfAll = (doc) => [document.body?.innerText || '', doc.body?.innerText || ''].join('\n');
+  const riskSignal = (doc, pattern) => {
+    const pageText = textOfAll(doc);
+    const normalizedPageText = normalize(pageText);
+    const keyword = (normalizedPageText.match(pattern) || [''])[0];
+    if (!keyword) {
+      return { hardStop: false, hardStopText: '', hardStopKeyword: '', hardStopTexts: [] };
+    }
+
+    const seen = new Set();
+    const candidates = [];
+    const clean = (text) => normalize(text).replace(/\u00a0/g, ' ').trim();
+    const addText = (text, source, priority = 0) => {
+      const value = clean(text);
+      if (!value || !pattern.test(value)) return;
+      if (value.length > 2500) return;
+      const key = value.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      candidates.push({
+        text: value,
+        source,
+        priority,
+        keywordOnly: value.length <= keyword.length + 4,
+      });
+    };
+
+    const docs = Array.from(new Set([document, doc].filter(Boolean)));
+    const prioritySelectors = [
+      '[role="alert"]',
+      '[role="dialog"]',
+      '.dialog-container',
+      '[class*="dialog"]',
+      '[class*="modal"]',
+      '[class*="popup"]',
+      '.boss-popup',
+      '.ui-dialog',
+      '[class*="toast"]',
+      '[class*="notice"]',
+      '[class*="warning"]',
+      '[class*="risk"]',
+      '[class*="captcha"]',
+      '[class*="verify"]',
+    ];
+
+    for (const root of docs) {
+      for (const selector of prioritySelectors) {
+        for (const node of Array.from(root.querySelectorAll(selector))) {
+          if (visible(node)) addText(node.innerText || node.textContent || '', selector, 3);
+        }
+      }
+    }
+
+    for (const root of docs) {
+      for (const node of Array.from(root.querySelectorAll('*'))) {
+        if (!visible(node)) continue;
+        const nodeText = clean(node.innerText || node.textContent || '');
+        if (!nodeText || !pattern.test(nodeText)) continue;
+        if (nodeText.length <= keyword.length + 4) {
+          addText(node.parentElement?.innerText || node.parentElement?.textContent || nodeText, 'parent', 1);
+        }
+        addText(nodeText, 'element', 0);
+      }
+    }
+
+    if (!candidates.length) {
+      const index = normalizedPageText.indexOf(keyword);
+      const start = Math.max(0, index - 160);
+      const end = Math.min(normalizedPageText.length, index + 600);
+      addText(normalizedPageText.slice(start, end), 'page-snippet', 0);
+    }
+
+    candidates.sort((left, right) => {
+      if (right.priority !== left.priority) return right.priority - left.priority;
+      if (left.keywordOnly !== right.keywordOnly) return Number(left.keywordOnly) - Number(right.keywordOnly);
+      return right.text.length - left.text.length;
+    });
+
+    return {
+      hardStop: true,
+      hardStopText: candidates[0]?.text || keyword,
+      hardStopKeyword: keyword,
+      hardStopTexts: candidates.slice(0, 3).map((item) => item.text),
+    };
+  };
   const clickByText = (doc, texts) => {
     const wanted = new Set(texts.map((item) => compact(item)));
     const nodes = Array.from(doc.querySelectorAll('button, a, span, div, li, label')).filter(visible);
@@ -176,7 +260,7 @@ const HELPERS = String.raw`
     }
     return false;
   };
-  window.__bossGreeter260505 = { normalize, compact, visible, getDoc, textOfAll, clickByText, getCards, readCard, confirmGreet };
+  window.__bossGreeter260505 = { normalize, compact, visible, getDoc, textOfAll, riskSignal, clickByText, getCards, readCard, confirmGreet };
 })();
 `;
 
@@ -188,14 +272,17 @@ export function inspectPage() {
   return execute(`
 const doc = window.__bossGreeter260505.getDoc();
 const text = window.__bossGreeter260505.textOfAll(doc);
+const risk = window.__bossGreeter260505.riskSignal(doc, ${HARD_STOP_PATTERN});
 const cards = window.__bossGreeter260505.getCards(doc);
 return JSON.stringify({
   url: location.href,
   title: document.title,
   bodyTextLength: text.length,
   candidateCards: cards.length,
-  hardStop: ${HARD_STOP_PATTERN}.test(text),
-  hardStopText: (text.match(${HARD_STOP_PATTERN}) || [''])[0],
+  hardStop: risk.hardStop,
+  hardStopText: risk.hardStopText,
+  hardStopKeyword: risk.hardStopKeyword,
+  hardStopTexts: risk.hardStopTexts,
 });
 `);
 }
@@ -204,7 +291,14 @@ export function assertReadyPage() {
   const info = inspectPage();
   if (!String(info.url || "").includes("zhipin.com")) throw new Error("当前不是 BOSS 页面");
   if (!String(info.url || "").includes("/web/chat/recommend")) throw new Error(`当前不是推荐牛人页: ${info.url}`);
-  if (info.hardStop) throw new Error(`检测到风控/异常信号: ${info.hardStopText}`);
+  if (info.hardStop) {
+    const error = new Error(`检测到风控/异常信号: ${info.hardStopText}`);
+    error.riskWarning = info.hardStopText || "";
+    error.riskKeyword = info.hardStopKeyword || "";
+    error.riskTexts = info.hardStopTexts || [];
+    error.riskStage = "页面预检";
+    throw error;
+  }
   return info;
 }
 
@@ -304,14 +398,17 @@ export function scanCandidates(limit = 15) {
   return execute(`
 const doc = window.__bossGreeter260505.getDoc();
 const text = window.__bossGreeter260505.textOfAll(doc);
+const risk = window.__bossGreeter260505.riskSignal(doc, ${HARD_STOP_PATTERN});
 const cards = window.__bossGreeter260505.getCards(doc)
   .map((card, index) => window.__bossGreeter260505.readCard(card, index))
   .filter((card) => card.visible && card.fingerprint)
   .sort((a, b) => a.top - b.top)
   .slice(0, ${Number(limit) || 15});
 return JSON.stringify({
-  hardStop: ${HARD_STOP_PATTERN}.test(text),
-  hardStopText: (text.match(${HARD_STOP_PATTERN}) || [''])[0],
+  hardStop: risk.hardStop,
+  hardStopText: risk.hardStopText,
+  hardStopKeyword: risk.hardStopKeyword,
+  hardStopTexts: risk.hardStopTexts,
   cards,
 });
 `);
@@ -321,8 +418,9 @@ export function clickGreet(candidate) {
   return execute(`
 const doc = window.__bossGreeter260505.getDoc();
 const text = window.__bossGreeter260505.textOfAll(doc);
-if (${HARD_STOP_PATTERN}.test(text)) {
-  return JSON.stringify({ ok: false, hardStop: true, reason: (text.match(${HARD_STOP_PATTERN}) || [''])[0] });
+const risk = window.__bossGreeter260505.riskSignal(doc, ${HARD_STOP_PATTERN});
+if (risk.hardStop) {
+  return JSON.stringify({ ok: false, hardStop: true, reason: risk.hardStopText || risk.hardStopKeyword, hardStopText: risk.hardStopText, hardStopKeyword: risk.hardStopKeyword, hardStopTexts: risk.hardStopTexts });
 } else {
   const cards = window.__bossGreeter260505.getCards(doc);
   const parsed = cards.map((card, index) => ({ element: card, raw: window.__bossGreeter260505.readCard(card, index) }));
@@ -350,12 +448,15 @@ export function verifyGreet(candidate) {
   return execute(`
 const doc = window.__bossGreeter260505.getDoc();
 const text = window.__bossGreeter260505.textOfAll(doc);
+const risk = window.__bossGreeter260505.riskSignal(doc, ${HARD_STOP_PATTERN});
 const cards = window.__bossGreeter260505.getCards(doc);
 const parsed = cards.map((card, index) => window.__bossGreeter260505.readCard(card, index));
 const target = parsed.find((item) => item.fingerprint === ${JSON.stringify(candidate.fingerprint)} || item.name === ${JSON.stringify(candidate.name)});
 return JSON.stringify({
-  hardStop: ${HARD_STOP_PATTERN}.test(text),
-  hardStopText: (text.match(${HARD_STOP_PATTERN}) || [''])[0],
+  hardStop: risk.hardStop,
+  hardStopText: risk.hardStopText,
+  hardStopKeyword: risk.hardStopKeyword,
+  hardStopTexts: risk.hardStopTexts,
   found: Boolean(target),
   buttonText: target?.buttonText || '',
   success: target ? target.buttonText === '继续沟通' : true,
@@ -372,8 +473,9 @@ function clickExpression(candidate) {
 const candidate = ${JSON.stringify(candidate)};
 const doc = window.__bossGreeter260505.getDoc();
 const text = window.__bossGreeter260505.textOfAll(doc);
-if (${HARD_STOP_PATTERN}.test(text)) {
-  return JSON.stringify({ ok: false, hardStop: true, reason: (text.match(${HARD_STOP_PATTERN}) || [''])[0] });
+const risk = window.__bossGreeter260505.riskSignal(doc, ${HARD_STOP_PATTERN});
+if (risk.hardStop) {
+  return JSON.stringify({ ok: false, hardStop: true, reason: risk.hardStopText || risk.hardStopKeyword, hardStopText: risk.hardStopText, hardStopKeyword: risk.hardStopKeyword, hardStopTexts: risk.hardStopTexts });
 }
 const cards = window.__bossGreeter260505.getCards(doc);
 const parsed = cards.map((card, index) => ({ element: card, raw: window.__bossGreeter260505.readCard(card, index) }));
@@ -400,12 +502,15 @@ function verifyExpression(candidate) {
 const candidate = ${JSON.stringify(candidate)};
 const doc = window.__bossGreeter260505.getDoc();
 const text = window.__bossGreeter260505.textOfAll(doc);
+const risk = window.__bossGreeter260505.riskSignal(doc, ${HARD_STOP_PATTERN});
 const cards = window.__bossGreeter260505.getCards(doc);
 const parsed = cards.map((card, index) => window.__bossGreeter260505.readCard(card, index));
 const target = parsed.find((item) => item.fingerprint === candidate.fingerprint || item.name === candidate.name);
 return JSON.stringify({
-  hardStop: ${HARD_STOP_PATTERN}.test(text),
-  hardStopText: (text.match(${HARD_STOP_PATTERN}) || [''])[0],
+  hardStop: risk.hardStop,
+  hardStopText: risk.hardStopText,
+  hardStopKeyword: risk.hardStopKeyword,
+  hardStopTexts: risk.hardStopTexts,
   found: Boolean(target),
   buttonText: target?.buttonText || '',
   success: target ? target.buttonText === '继续沟通' : true,
@@ -437,14 +542,17 @@ function fingerprintExpression(limit) {
   return pageExpression(`
 const doc = window.__bossGreeter260505.getDoc();
 const text = window.__bossGreeter260505.textOfAll(doc);
+const risk = window.__bossGreeter260505.riskSignal(doc, ${HARD_STOP_PATTERN});
 const cards = window.__bossGreeter260505.getCards(doc)
   .map((card, index) => window.__bossGreeter260505.readCard(card, index))
   .filter((card) => card.visible && card.fingerprint)
   .sort((a, b) => a.top - b.top)
   .slice(0, ${Number(limit) || 15});
 return JSON.stringify({
-  hardStop: ${HARD_STOP_PATTERN}.test(text),
-  hardStopText: (text.match(${HARD_STOP_PATTERN}) || [''])[0],
+  hardStop: risk.hardStop,
+  hardStopText: risk.hardStopText,
+  hardStopKeyword: risk.hardStopKeyword,
+  hardStopTexts: risk.hardStopTexts,
   fingerprints: cards.map((card) => card.fingerprint),
 });
 `);
@@ -508,7 +616,9 @@ export function greetCandidates(candidates, options = {}) {
       output.results.push(failed);
       if (click.hardStop) {
         output.hardStop = true;
-        output.hardStopText = click.reason || '';
+        output.hardStopText = click.hardStopText || click.reason || '';
+        output.hardStopKeyword = click.hardStopKeyword || '';
+        output.hardStopTexts = click.hardStopTexts || [];
         break;
       }
       continue;
@@ -531,6 +641,8 @@ export function greetCandidates(candidates, options = {}) {
       output.results.push(Object.assign({}, step.candidate, { action: 'failed', result: verify.hardStopText || 'hard_stop', click: click, verify: verify, hardStop: true }));
       output.hardStop = true;
       output.hardStopText = verify.hardStopText || '';
+      output.hardStopKeyword = verify.hardStopKeyword || '';
+      output.hardStopTexts = verify.hardStopTexts || [];
       break;
     }
     if (!verify.success) {
@@ -600,6 +712,8 @@ export function scrollForMoreAndWait(previousFingerprints = [], options = {}) {
     waitMs: Math.max(0, Date.now() - startedAt),
     hardStop: Boolean(fingerprintResult.hardStop),
     hardStopText: fingerprintResult.hardStopText || '',
+    hardStopKeyword: fingerprintResult.hardStopKeyword || '',
+    hardStopTexts: fingerprintResult.hardStopTexts || [],
     fingerprints: fingerprintResult.fingerprints || [],
   });
   `);
@@ -630,8 +744,9 @@ export function refreshRecommendPool() {
   return execute(`
 const doc = window.__bossGreeter260505.getDoc();
 const text = window.__bossGreeter260505.textOfAll(doc);
-if (${HARD_STOP_PATTERN}.test(text)) {
-  return JSON.stringify({ ok: false, hardStop: true, reason: (text.match(${HARD_STOP_PATTERN}) || [''])[0] });
+const risk = window.__bossGreeter260505.riskSignal(doc, ${HARD_STOP_PATTERN});
+if (risk.hardStop) {
+  return JSON.stringify({ ok: false, hardStop: true, reason: risk.hardStopText || risk.hardStopKeyword, hardStopText: risk.hardStopText, hardStopKeyword: risk.hardStopKeyword, hardStopTexts: risk.hardStopTexts });
 }
 const compact = window.__bossGreeter260505.compact;
 const visible = window.__bossGreeter260505.visible;
